@@ -423,7 +423,6 @@ function usageOf(data) {
   const account = data?.userPointInfo?.account ?? {};
   const balance = Number.isFinite(account.availableBalance) ? account.availableBalance : null;
   const granted = Number.isFinite(account.totalGranted) ? account.totalGranted : null;
-  const consumed = Number.isFinite(account.totalConsumed) ? account.totalConsumed : null;
 
   const windows = [];
   if (balance !== null) {
