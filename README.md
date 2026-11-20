@@ -68,13 +68,48 @@ qwen3.8-flash@deep        deepest reasoning
 ```
 
 Every upstream model gets all three, so the model count is `upstream × 3`
-(14 × 3 = **42** in practice).
+(16 × 3 = **48** for the current Meoo catalogue).
 
 The plugin strips the `@tier` suffix before calling Meoo, and keeps the full
 variant name in the response's `model` field.
 
 A model id without a suffix falls back to the default tier
 (`fast`, overridable with `MEOO_SPEED_TIER`).
+
+## Model capabilities (context window / max output)
+
+The model list is genuinely synced: `models.refresh` reads
+`GET /open/v1/projects/{id}/agent/capabilities`, which returns **only** `{id, name}` per
+model — no context window, no max output, no modality flags. Every other candidate
+endpoint (`/open/v1/models`, `/agent/models`, `/me`, `/usage`, `/credits`,
+`/entitlement`, `/projects/{id}`, `/docs`) answers `404 not_found`, and the web SPA
+ships no capability table either. So context/output **cannot be synced from Meoo**:
+the plugin declares them.
+
+Declared values (see `SPEC` / `SPEC_DEFAULT` in `index.mjs`):
+
+| Model | Context | Max output |
+| --- | --- | --- |
+| `deepseek-v4-pro-0813` | 1 000 000 | 384 000 |
+| everything else | 200 000 | 64 000 |
+
+Lookups go through `specKey()`, which lowercases the id, drops the vendor prefix,
+folds separators to `-` and strips a trailing 4-digit date stamp — so Meoo renaming
+`DeepSeek/deepseek-v4.1-flash` to `deepseek-v4.1-flash-1017` keeps hitting the same
+entry instead of collapsing to 0 (the original "上游未声明" bug).
+
+Override without touching code, either
+
+- by environment variable `MEOO_MODEL_SPECS`, a JSON object keyed by the raw id or the
+  normalized one, e.g. `{"deepseek-v4.1-flash-1017":{"context":1000000,"output":128000}}`, or
+- in the panel's **模型能力** dialog, which writes a per-model override layer that wins
+  over the plugin's declaration.
+
+`supportsToolCall` / `supportsImages` / `supportsVideo` / `supportsReasoning` stay
+`false` on purpose: the Run payload only carries `{message, model, speed_tier}`, the
+SSE stream has no reasoning channel, and `flatten()` downgrades multimodal content to
+`[image_url]` text. Marking them `true` would make downstream clients send images and
+tools that Meoo silently drops.
 
 ## Environment variables
 
@@ -83,6 +118,7 @@ All optional. Read when the plugin loads, i.e. **before magpie starts**.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `MEOO_SPEED_TIER` | `fast` | **Fallback only** — used when a model id carries no `@tier` |
+| `MEOO_MODEL_SPECS` | — | JSON overrides for the context/output spec table (raw or normalized model ids) |
 | `MEOO_PROJECT_NAME` | `Magpie Bridge` | Meoo project the Agent works in; reused when it already exists |
 | `MEOO_TIMEOUT_MS` | `600000` | Per-Run timeout in milliseconds |
 | `MEOO_AUTO_ANSWER` | see source | Auto-reply when the Agent asks a question. Empty string = fail instead of auto-answering |

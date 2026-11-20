@@ -67,11 +67,41 @@ qwen3.8-flash@standard    标准
 qwen3.8-flash@deep        深度
 ```
 
-每个上游模型都有这三个变体，所以模型数 = 上游模型数 × 3（实测 14 × 3 = **42 个**）。
+每个上游模型都有这三个变体，所以模型数 = 上游模型数 × 3（当前 Meoo 在售 16 个，共 **48 个**）。
 
 插件在起 Run 前会把 `@档位` 后缀剥掉再发给 Meoo，响应里的 `model` 字段仍保留完整变体名。
 
 没带 `@档位` 的模型 ID 走兜底档（默认 `fast`，可用 `MEOO_SPEED_TIER` 覆盖）。
+
+## 模型能力（上下文窗口 / 最大输出）
+
+模型清单是**真同步**的：`models.refresh` 读
+`GET /open/v1/projects/{id}/agent/capabilities`，而它每个模型**只给 `{id, name}`** —— 没有
+上下文窗口、没有最大输出、没有任何模态位。其余候选端点（`/open/v1/models`、
+`/agent/models`、`/me`、`/usage`、`/credits`、`/entitlement`、`/projects/{id}`、`/docs`）
+一律 `404 not_found`，网页前端也不带能力表。所以上下文/输出**同步不来**，只能由插件声明。
+
+声明的值（见 `index.mjs` 的 `SPEC` / `SPEC_DEFAULT`）：
+
+| 模型 | 上下文 | 最大输出 |
+| --- | --- | --- |
+| `deepseek-v4-pro-0813` | 1 000 000 | 384 000 |
+| 其余全部 | 200 000 | 64 000 |
+
+查表走 `specKey()`：小写化 → 去掉 vendor 前缀 → 分隔符折叠成 `-` → 去掉尾部 4 位日期戳。
+所以 Meoo 把 `DeepSeek/deepseek-v4.1-flash` 改名成 `deepseek-v4.1-flash-1017` 之后，仍然命中
+同一条规格，而不是塌成 0（原来的「上游未声明」就是这么来的）。
+
+不改代码的两种覆盖方式：
+
+- 环境变量 `MEOO_MODEL_SPECS`，JSON 对象，键可以用原 ID 或归一化 ID，例如
+  `{"deepseek-v4.1-flash-1017":{"context":1000000,"output":128000}}`；
+- 面板的**模型能力**弹窗，写入的是「覆盖层」，优先级高于插件的声明。
+
+`supportsToolCall` / `supportsImages` / `supportsVideo` / `supportsReasoning` 保持
+`false` 是**如实**：起 Run 的报文只有 `{message, model, speed_tier}`，SSE 里没有思考通道，
+`flatten()` 会把多模态内容降级成 `[image_url]` 文本。标成 `true` 只会让下游发图片和工具调用，
+然后被 Meoo 静默丢掉。
 
 ## 环境变量
 
@@ -80,6 +110,7 @@ qwen3.8-flash@deep        深度
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `MEOO_SPEED_TIER` | `fast` | **仅兜底** —— 模型 ID 没带 `@档位` 时才用 |
+| `MEOO_MODEL_SPECS` | — | 覆盖上下文/输出的规格表，JSON，键为原 ID 或归一化 ID |
 | `MEOO_PROJECT_NAME` | `Magpie Bridge` | Agent 工作所在的项目名，同名复用不重复创建 |
 | `MEOO_TIMEOUT_MS` | `600000` | 单次 Run 超时（毫秒） |
 | `MEOO_AUTO_ANSWER` | 见源码 | Agent 反问时的自动回答。设为空字符串则不自动回答，直接报错 |
