@@ -43,6 +43,16 @@ bun add github:RexVane/magpie-plugin-meoo-agent
 **Provider id：** `meoo-agent` · **认证方式：** `API key` —— 在
 [meoo.com](https://meoo.com) → 设置 → API 密钥 建一把 `meoo_ak_...`。
 
+### 在 Agent2API 里用
+
+同一个 `index.mjs` 也是合法的 **Agent2API 脚本插件**（宿主契约一致：导出函数会被当作
+provider 入口，`auth.loader` / `auth.usage` / `auth.methods[].authorize` 都按原样调用）。
+在网关的「插件 → 脚本插件」里用 `github:RexVane/magpie-plugin-meoo-agent`（或你自己的 fork）
+安装即可，安装后 provider id 仍是 `meoo-agent`。
+
+装好后账号页会多出两列真实读数：「余额」显示积分余额与逐份到期，「有效期」显示套餐周期到期日
+（见下节）。
+
 ## 档位：做成模型变体
 
 Meoo 的起 Run 接口有个 `speed_tier` 字段（`fast` 优先低延迟 /
@@ -72,6 +82,52 @@ qwen3.8-flash@deep        深度
 | `MEOO_TIMEOUT_MS` | `600000` | 单次 Run 超时（毫秒） |
 | `MEOO_AUTO_ANSWER` | 见源码 | Agent 反问时的自动回答。设为空字符串则不自动回答，直接报错 |
 | `MEOO_VERBOSE` | 关 | `1` 打开插件日志，排查用 |
+
+## 余额与有效期（积分）
+
+Meoo 的 Open API 没有账单端点 —— `/open/v1/account`、`/balance`、`/credits`、
+`/usage`、`/plans` 全部 404。真实的数字在网页控制面上，而 API Key 只有在自称 CLI
+时才能访问它：
+
+```
+GET https://meoo.com/api/mc/entitlement/get
+Authorization: Bearer meoo_ak_...
+X-Meoo-Client: cli
+```
+
+不带 `X-Meoo-Client: cli` 时所有 `/api/mc/*` 与 `/api/v1/*` 都返回
+`401 API_KEY_CLIENT_REQUIRED`；`X-Client-Type`、`X-Meoo-Client: meoo-cli`、
+`User-Agent: meoo-cli/...` 都不行（实测）。这个头不影响 `/open/v1`，所以插件全局都带。
+
+插件用两个钩子吃这个接口：
+
+- **`auth.methods[0].authorize`** —— 登录时先用 `entitlement/get` 校验这把 key，
+  再从 `/api/v1/user/me` 拿身份，把最早的**真实**到期时刻
+  （`activeGrants[].grantDetails[].expiresDate`，取不到就退回 `currentPeriodEnd`）
+  以 **`expires` 与 `expiresAt` 两个键**写进账号；每次查余额还会把账号名刷成 Meoo 的显示名。
+- **`auth.usage`** —— 上报积分余额，让网关把「余额」列从「—」变成真读数。
+
+界面上看到的东西：
+
+| 字段 | 来源 | 显示成 |
+| --- | --- | --- |
+| 积分余额 | `userPointInfo.account.availableBalance` / `totalGranted` | 窗口 `剩 8137 / 9000 积分` + 进度条 |
+| 逐份到期 | `userPointInfo.activeGrants[].grantDetails[]` | 每份一条 `积分到期` 窗口，如 `登录赠送积分 · 11-26 到期` |
+| 套餐 | `data.planName` | 套餐徽章（`Free 免费版` → 免费版） |
+| 有效期 | 账号记录里的 `expiresAt` | `N 天后` |
+
+几条踩出来的硬约束：
+
+1. 免费版的 `activatedEndTime` 是 `9999-12-31`，**绝不能**拿来当有效期。
+2. 逐份到期行带 `aside: true`，网关转发前的额度预判（`remainingPercent === 0` 或
+   `balance === 0` 就 `429`）会跳过它们；主窗口必须报**真实**余额 —— 那里报 0 会直接
+   把转发拦掉。
+3. 宿主的 `reports.mjs` 把 `row.name` 同时当成 `label` 与 `window`，而弹层只渲染
+   `resetsAt`，所以到期日只能塞进窗口名（`· MM-DD 到期`），并把 `resetsAt` 设成该份的到期时刻。
+4. `credit_detail` 仍是 `false`：逐份明细用的 `credits[]` 只有 Rust provider 能产出，
+   脚本插件通道拿不到。
+5. `long_lived` 被宿主的 `models.mjs` 对所有远端 provider 写死为 `false`，所以账号不会
+   被标成「长期有效」，而是显示真实日期。
 
 ## 已知限制
 

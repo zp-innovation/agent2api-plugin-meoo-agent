@@ -16,9 +16,18 @@
 //   - Meoo 文档写明这把 key「不能作为绕过团队系统集成和集成版权益套餐的方式」
 
 const ID = "meoo-agent";
-const API = "https://meoo.com/open/v1";
+const SITE = "https://meoo.com";
+const API = `${SITE}/open/v1`;
+// 网页控制面（积分 / 有效期只在这里，Open API 没有对应端点）
+const WEB = SITE;
 const CHAT = "@ai-sdk/openai-compatible";
 const FELL_BACK = Symbol.for("magpie.fellBack");
+
+// Meoo 的 API Key 只对「CLI 身份」开放网页控制面接口。缺这个头时
+// /api/mc/* 与 /api/v1/* 一律 401 API_KEY_CLIENT_REQUIRED；写成
+// X-Client-Type、User-Agent: meoo-cli 之类都无效（实测）。加上它不影
+// 响 /open/v1（同一把 key 仍能建项目、起 Run）。
+const CLIENT_HEADER = { "X-Meoo-Client": "cli" };
 
 // 档位做成模型变体（<model>@fast / @standard / @deep），从模型下拉框里选，
 // 不依赖环境变量。MEOO_SPEED_TIER 只作为「模型 ID 没带 @档位」时的兜底。
@@ -110,6 +119,7 @@ async function meoo(key, path, { method = "GET", body, headers = {}, signal } = 
     method,
     headers: {
       Authorization: `Bearer ${key}`,
+      ...CLIENT_HEADER,
       ...(body ? { "Content-Type": "application/json" } : {}),
       ...headers,
     },
@@ -160,6 +170,93 @@ async function capabilities(key, projectId) {
 }
 
 // ---- SSE ----------------------------------------------------------------------
+
+// ---- 网页控制面（积分 / 有效期）-----------------------------------------------
+
+// entitlement/get 是 Meoo 唯一同时给出「真实积分余额」与「周期到期时刻」的接口。
+// 它只接受 CLI 身份（见 CLIENT_HEADER），返回 {success,data:{...}}。
+async function web(key, path, { signal } = {}) {
+  const res = await fetch(WEB + path, { headers: { Authorization: `Bearer ${key}`, ...CLIENT_HEADER }, signal });
+  const text = await res.text();
+  let json = null;
+  try { json = text ? JSON.parse(text) : null; } catch {}
+  if (!res.ok) {
+    const err = new Error(json?.error?.message || json?.detail || `Meoo ${path} -> ${res.status}`);
+    err.status = res.status;
+    err.code = json?.error?.code || json?.code;
+    throw err;
+  }
+  return json;
+}
+
+// Meoo 的周期时间是**无时区本地串**（"2026-12-19T00:00:00"）。网关侧
+// reports.mjs 与本插件都用 Date.parse，两侧口径一致，因此这里不做时区
+// 换算 —— 换算反而会和宿主显示的「到期」差几个小时。
+function millis(value) {
+  const raw = typeof value === "string" ? Date.parse(value) : Number(value);
+  return Number.isFinite(raw) && raw > 0 && raw <= 8.64e15 ? raw : 0;
+}
+
+// 到期时刻的取值优先级：
+//   activeGrants 里最晚的 expiresDate（真正会到期的那份积分）
+//   → currentPeriodEnd（本周期结束）
+//   → 0（不报）
+// activatedEndTime 恒为 9999-12-31（免费版不过期），永远不能拿来当有效期。
+function expiryOf(data) {
+  let latest = 0;
+  for (const grant of data?.userPointInfo?.activeGrants ?? []) {
+    for (const detail of grant?.grantDetails ?? []) {
+      const at = millis(detail?.expiresDate);
+      if (at > latest) latest = at;
+    }
+  }
+  if (!latest) latest = millis(data?.currentPeriodEnd);
+  return latest;
+}
+
+async function identify(key, signal) {
+  try {
+    const me = await web(key, "/api/v1/user/me", { signal });
+    const d = me?.data ?? {};
+    return { uid: d.id ? String(d.id) : "", email: d.email ?? "", name: d.name ?? "" };
+  } catch (e) {
+    log("取用户信息失败：", e.message);
+    return {};
+  }
+}
+
+// 登录时用一次 entitlement 校验 key 并把到期时刻落进账号记录。
+// 落在 secret 的 expiresAt（而不是 expires）是因为网关落库走
+// plugin_public.rs 的白名单键名 EXPIRY_KEYS，只认 expiresAt 这一族；
+// 前端「有效期」列读的正是公开形态里的 expiresAt。
+async function authorize(inputs, { signal } = {}) {
+  const key = typeof inputs?.key === "string" ? inputs.key.trim() : "";
+  if (!key) return { type: "failed", error: "请填写 Meoo API Key" };
+  let data;
+  try {
+    const body = await web(key, "/api/mc/entitlement/get", { signal });
+    if (body?.success === false) {
+      return { type: "failed", error: body?.error?.message || "Meoo 未接受这把 API Key" };
+    }
+    data = body?.data ?? {};
+  } catch (e) {
+    // 401 是「key 不对」，其余（网络、5xx）不该把用户的 key 判死：
+    // 仍然允许保存，只是这次拿不到有效期。
+    if (e?.status === 401 || e?.status === 403) {
+      return { type: "failed", error: e.message || "Meoo 拒绝了这把 API Key" };
+    }
+    log("登录期查询权益失败，先保存凭据：", e.message);
+    const who = await identify(key, signal);
+    return { type: "success", key, ...who };
+  }
+  const who = await identify(key, signal);
+  const expires = expiryOf(data);
+  return {
+    type: "success", key, ...who,
+    metadata: { planName: data?.planName ?? "" },
+    ...(expires ? { expires, expiresAt: expires } : {}),
+  };
+}
 
 async function* sseFrames(res) {
   const reader = res.body.getReader();
@@ -237,7 +334,9 @@ async function drive(key, projectId, runId, signal, onDelta) {
 
   for (;;) {
     const url = `${API}/projects/${encodeURIComponent(projectId)}/agent/runs/${encodeURIComponent(current)}/events`;
-    const res = await fetch(url, { headers: { Authorization: `Bearer ${key}`, Accept: "text/event-stream" }, signal });
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${key}`, ...CLIENT_HEADER, Accept: "text/event-stream" }, signal,
+    });
 
     if (res.status === 429) {
       const wait = (Number(res.headers.get("retry-after") || 60) + Math.random() * 5) * 1000;
@@ -281,6 +380,87 @@ async function drive(key, projectId, runId, signal, onDelta) {
   }
   if (failure) throw new Error(failure);
   return { text, credits: credits.toString() };
+}
+
+// ---- 余额 / 有效期（auth.usage 的返回形状）-------------------------------------
+//
+// 网关 reports.mjs 只透传这些键（没有 credits[] 顶层字段），所以「积分明细」
+// 只能落到 windows[] 上：一条总余额 + 每份积分一条到期行。
+// 注意 windows[].used 在网关里是**百分比**（100-used = 剩余百分比），不是用量。
+
+const MD = (value) => {
+  const at = millis(value);
+  if (!at) return "";
+  const d = new Date(at);
+  return `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+
+function usageOf(data) {
+  const account = data?.userPointInfo?.account ?? {};
+  const balance = Number.isFinite(account.availableBalance) ? account.availableBalance : null;
+  const granted = Number.isFinite(account.totalGranted) ? account.totalGranted : null;
+  const consumed = Number.isFinite(account.totalConsumed) ? account.totalConsumed : null;
+
+  const windows = [];
+  if (balance !== null) {
+    // limit 与 balance 一起报：网关用 balance 定「剩余」，用 used 定百分比。
+    // 千万不要在这条上报 0 —— allowance.mjs 会据此真拦截转发。
+    const percent = granted && granted > 0 ? Math.max(0, Math.min(100, (100 * (granted - balance)) / granted)) : null;
+    windows.push({
+      name: "积分余额", group: "积分", window: "当前积分",
+      limit: granted ?? undefined, balance, used: percent ?? undefined,
+      unit: "积分", resetsAt: millis(data?.currentPeriodEnd) || undefined,
+    });
+  }
+  for (const grant of data?.userPointInfo?.activeGrants ?? []) {
+    const label = grant?.sourceTypeName || grant?.sourceType || "积分";
+    for (const detail of grant?.grantDetails ?? []) {
+      const amount = Number.isFinite(detail?.remainingAmount) ? detail.remainingAmount : null;
+      if (amount === null) continue;
+      const at = millis(detail?.expiresDate);
+      const date = MD(detail?.expiresDate);
+      windows.push({
+        // 日期只能写进 name：网关 reports.mjs 的 label 与 window 都取 row.name
+        // （它根本读不到 row.window），而弹层又只渲染 resetsAt。
+        name: date ? `${label} · ${date} 到期` : `${label} · 未注明到期`,
+        group: "积分到期",
+        // 这份积分还剩多少 = balance；limit 同值 + used:0 只为让
+        // remainingPercent 算得出 100（否则前端状态从「额度充足」掉成
+        // 「部分读数未知」，见 accounts-usage-windows.tsx:141）。
+        limit: amount, balance: amount, used: 0, unit: "积分",
+        // aside 让 allowance.mjs:5-12 跳过这条：逐份积分的到期不等于
+        // 「现在就不能用了」，参与拦截会把一次正常请求误判成配额耗尽。
+        aside: true,
+        resetsAt: at || undefined,
+      });
+    }
+  }
+
+  const plan = typeof data?.planName === "string" ? data.planName.trim() : "";
+  const until = millis(data?.currentPeriodEnd);
+  if (!windows.length) {
+    return { windows: [], empty: true, emptyText: plan ? `${plan} 账号没有可用积分` : "Meoo 没有返回积分余额" };
+  }
+  return { windows, ...(plan ? { plan, until: until || undefined } : {}) };
+}
+
+async function usage(getAuth, sync) {
+  const auth = await getAuth();
+  if (auth?.type !== "api" || !auth.key) return { signIn: "expired", error: "meoo-agent：未登录" };
+  let body;
+  try {
+    body = await web(auth.key, "/api/mc/entitlement/get");
+  } catch (e) {
+    // 401 = key 被吊销/过期：让网关把账号标成「需重新登录」，而不是一条普通查询失败。
+    if (e?.status === 401) return { signIn: "expired", error: e.message };
+    return { error: `Meoo 权益查询失败：${e.message}` };
+  }
+  if (body?.success === false) return { error: body?.error?.message || "Meoo 未返回权益" };
+  const data = body?.data ?? {};
+  const report = usageOf(data);
+  const who = await identify(auth.key);
+  await sync?.(expiryOf(data), who);
+  return { ...report, ...(who.name || who.email ? { user: who.name || who.email } : {}) };
 }
 
 // ---- chat completion ⇄ Meoo ----------------------------------------------------
@@ -376,6 +556,42 @@ async function translate(key, chat, signal) {
 // ---- 插件 ---------------------------------------------------------------------
 
 export async function MeooPlugin({ client } = {}) {
+  // 只有 usage.query 这类「有账号上下文」的调用才允许把新到期时刻写回账号：
+  // 登录期（account.normalize）没有账号，宿主的 setAuth 只会写进内存上下文。
+  //
+  // 两个键都写：网关落库（plugin_public.rs 的 EXPIRY_KEYS 白名单）只认
+  // expiresAt 这一族；而宿主 JS 侧的 publicAccount() 只认 expires。
+  // 少写任何一个，都会有一侧的「有效期」变成「—」。
+  // name 也必须一起回写：宿主 publicAccount() 的名字取值顺序是
+  // name → email → accountId → uid，凭据里没有 name 时「有效期」列旁的账号名
+  // 会退化成 uid（一串数字）。回写 name 才能让它显示成 Meoo 上的昵称。
+  const saveExpiry = async (expiresAt, who) => {
+    if (!client?.auth?.set) return;
+    const name = who?.name || "";
+    const uid = who?.uid || "";
+    if (!expiresAt && !name) return;
+    try {
+      const current = (await client.auth.get({}))?.data;
+      if (!current?.key) return;
+      const same = (!expiresAt || (current.expiresAt === expiresAt && current.expires === expiresAt))
+        && (!name || current.name === name)
+        && (!uid || current.uid === uid);
+      if (same) return;
+      await client.auth.set({
+        // id 必须是本 provider 的 originalID：分配出的 id 可能带 -plugin 后缀。
+        id: ID,
+        body: {
+          ...current,
+          ...(expiresAt ? { expires: expiresAt, expiresAt } : {}),
+          ...(name ? { name } : {}),
+          ...(uid ? { uid } : {}),
+        },
+      });
+    } catch (e) {
+      log("写回账号信息失败：", e.message);
+    }
+  };
+
   return {
     auth: {
       provider: ID,
@@ -386,7 +602,7 @@ export async function MeooPlugin({ client } = {}) {
         return {
           baseURL: API,
           apiKey: key,
-          headers: {},
+          headers: { ...CLIENT_HEADER },
           // 只有 chat completions 需要改写；其余请求（如列模型）原样放过
           async fetch(input, init = {}) {
             const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
@@ -409,8 +625,16 @@ export async function MeooPlugin({ client } = {}) {
           },
         };
       },
+      // 网关在 usage.query 里先 refresh（对 api key 是 no-op），再调这里；
+      // 结果经 reports.mjs 归一化成余额格 / 有效期列要的形状。
+      usage: (getAuth) => usage(getAuth, saveExpiry),
       methods: [
-        { type: "api", label: "API key（meoo.com → 设置 → API 密钥）" },
+        {
+          type: "api",
+          label: "API key（meoo.com → 设置 → API 密钥）",
+          // 登录即校验：key 无效当场拒绝；有效则把套餐到期时刻一起写进凭据。
+          authorize,
+        },
       ],
     },
 
@@ -464,4 +688,7 @@ export async function MeooPlugin({ client } = {}) {
   };
 }
 
-export const _internal = { sseFrames, parseFrame, flatten, splitTier, variantIds, MODELS, TIERS, ID, API };
+export const _internal = {
+  sseFrames, parseFrame, flatten, splitTier, variantIds, MODELS, TIERS, ID, API, WEB,
+  expiryOf, millis, usageOf, CLIENT_HEADER,
+};
