@@ -1,4 +1,4 @@
-# magpie-plugin-meoo-agent
+# agent2api-plugin-meoo-agent
 
 [English](README.md) · [简体中文](README.zh-CN.md)
 
