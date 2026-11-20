@@ -34,11 +34,10 @@ const FELL_BACK = Symbol.for("magpie.fellBack");
 // 响 /open/v1（同一把 key 仍能建项目、起 Run）。
 const CLIENT_HEADER = { "X-Meoo-Client": "cli" };
 
-// 官方 logo —— meoo.com 首页 <link rel="icon"> 指向的阿里云 CDN 原图（184×184 PNG，
-// 副本存在本仓 assets/meoo.png 便于核对）。宿主只接受 https 地址或 data:image/，
-// 拿到后会自己下载、校验格式、按 sha256 缓存成 /plugins/script-icons/<hash>.png，
-// 插件不需要往请求里塞任何东西。换地址只会让宿主当成一张新图重下一次。
-const ICON = "https://gw.alicdn.com/imgextra/i4/O1CN01MxUXzS1xYRjMwA2la_!!6000000006455-2-tps-184-184.png";
+// 官方 logo（内嵌 data:image/png;base64，原因与尺寸约束见 icon.mjs 顶部注释）。
+// 用 https 地址在这台网关上永远不会成功：容器 DNS 是 fake-ip，公网域名一律
+// 解析到 198.18.0.0/15 保留段，会被 icons/download.rs 的 public_ip() 拒收。
+import { ICON } from "./icon.mjs";
 
 // 档位做成模型变体（<model>@fast / @standard / @deep），从模型下拉框里选，
 // 不依赖环境变量。MEOO_SPEED_TIER 只作为「模型 ID 没带 @档位」时的兜底。
@@ -624,9 +623,10 @@ export async function MeooPlugin({ client } = {}) {
   return {
     auth: {
       provider: ID,
-      // 宿主的 loader.mjs:102 `icon(hooks.auth.icon)` 收下它，再交给
-      // icons/cache.rs 下载 + 校验 + 按 sha256 落盘，前端就能从
-      // /api/session 的 providerIcons 拿到 /plugins/script-icons/xxx.png。
+      // 宿主的 loader.mjs:102 `icon(hooks.auth.icon)` 收下它；内嵌 data: 走
+      // icons/formats.rs 的 inline()，解 base64 + 验魔数 + 按 sha256 落盘，
+      // 全程不碰 DNS。前端从 /api/session 的 providerIcons 拿到
+      // /plugins/script-icons/<hash>.png。
       icon: ICON,
       async loader(getAuth) {
         const auth = await getAuth();
