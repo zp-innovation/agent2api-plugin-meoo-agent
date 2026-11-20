@@ -31,7 +31,7 @@ Inside magpie, open the **unofficial plugins (GitHub)** list and install it, or 
 
 ```bash
 cd ~/.config/magpie/plugins
-bun add github:RexVane/magpie-plugin-meoo-agent
+bun add github:zp-innovation/agent2api-plugin-meoo-agent
 ```
 
 then add to `~/.config/magpie/plugins.json`:
@@ -48,7 +48,7 @@ then add to `~/.config/magpie/plugins.json`:
 The same `index.mjs` is a valid **Agent2API script plugin** — the host contract is the
 same shape (exported functions become provider entries; `auth.loader`, `auth.usage` and
 `auth.methods[].authorize` are called as-is). Install it in the gateway's
-**Plugins → Script plugins** with `github:RexVane/magpie-plugin-meoo-agent` (or your own
+**Plugins → Script plugins** with `github:zp-innovation/agent2api-plugin-meoo-agent` (or your own
 fork); the provider id stays `meoo-agent`.
 
 Once installed, the accounts page gains two real columns: **balance** (credit balance plus

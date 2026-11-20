@@ -1,4 +1,6 @@
-# magpie-plugin-meoo-agent
+# agent2api-plugin-meoo-agent
+
+> 包名（`package.json` 的 `name`）仍是 `magpie-plugin-meoo-agent`，显示名由 `magpie.name` 指定为 `agent2api-plugin-meoo-agent`。
 
 [English](README.md) · [简体中文](README.zh-CN.md)
 
@@ -31,7 +33,7 @@ Meoo 的 Open API **没有 chat completions**。它只有三个概念：
 
 ```bash
 cd ~/.config/magpie/plugins
-bun add github:RexVane/magpie-plugin-meoo-agent
+bun add github:zp-innovation/agent2api-plugin-meoo-agent
 ```
 
 然后在 `~/.config/magpie/plugins.json` 里加：
@@ -47,7 +49,7 @@ bun add github:RexVane/magpie-plugin-meoo-agent
 
 同一个 `index.mjs` 也是合法的 **Agent2API 脚本插件**（宿主契约一致：导出函数会被当作
 provider 入口，`auth.loader` / `auth.usage` / `auth.methods[].authorize` 都按原样调用）。
-在网关的「插件 → 脚本插件」里用 `github:RexVane/magpie-plugin-meoo-agent`（或你自己的 fork）
+在网关的「插件 → 脚本插件」里用 `github:zp-innovation/agent2api-plugin-meoo-agent`（或你自己的 fork）
 安装即可，安装后 provider id 仍是 `meoo-agent`。
 
 装好后账号页会多出两列真实读数：「余额」显示积分余额与逐份到期，「有效期」显示套餐周期到期日
