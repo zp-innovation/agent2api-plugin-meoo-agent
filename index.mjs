@@ -189,11 +189,20 @@ async function web(key, path, { signal } = {}) {
   return json;
 }
 
-// Meoo 的周期时间是**无时区本地串**（"2026-12-19T00:00:00"）。网关侧
-// reports.mjs 与本插件都用 Date.parse，两侧口径一致，因此这里不做时区
-// 换算 —— 换算反而会和宿主显示的「到期」差几个小时。
+// Meoo 给的时间是**不带时区的北京时间串**（"2026-12-19T00:00:00"）。
+// 直接 Date.parse 会按「运行环境的本地时区」解释 —— 网关跑在容器里通常是
+// UTC，于是 12-19 00:00 会被算成北京时间 12-19 08:00，到期日整整晚 8 小时，
+// 23:59:59 那几份还会跨到第二天，和标签上的日期对不上。所以这里显式补
+// +08:00，让结果与宿主、与用户看到的中文时间一致，且不依赖进程 TZ。
+const CN_OFFSET = 8 * 60 * 60 * 1000;
+const NAIVE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/;
+
 function millis(value) {
-  const raw = typeof value === "string" ? Date.parse(value) : Number(value);
+  let raw;
+  if (typeof value === "string") {
+    const s = value.trim();
+    raw = Date.parse(NAIVE.test(s) ? `${s}+08:00` : s);
+  } else raw = Number(value);
   return Number.isFinite(raw) && raw > 0 && raw <= 8.64e15 ? raw : 0;
 }
 
@@ -388,11 +397,13 @@ async function drive(key, projectId, runId, signal, onDelta) {
 // 只能落到 windows[] 上：一条总余额 + 每份积分一条到期行。
 // 注意 windows[].used 在网关里是**百分比**（100-used = 剩余百分比），不是用量。
 
+// 标签上的日期必须与 Meoo 写的那一天一致，所以按北京时间取年月日，
+// 不用 getMonth()/getDate()（那会跟着进程 TZ 走，容器里是 UTC 就会差一天）。
 const MD = (value) => {
   const at = millis(value);
   if (!at) return "";
-  const d = new Date(at);
-  return `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  const d = new Date(at + CN_OFFSET);
+  return `${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
 };
 
 function usageOf(data) {

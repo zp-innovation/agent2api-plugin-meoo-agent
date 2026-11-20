@@ -7,3 +7,4 @@
 - 2026-11-20 10:35 | #005 | 余额 | 新增 `auth.usage`：用 `X-Meoo-Client: cli` 调 `GET https://meoo.com/api/mc/entitlement/get` 上报积分余额（availableBalance/totalGranted）与逐份到期（activeGrants.grantDetails），顶层报 plan/until；逐份行带 `aside: true` 以免参与 429 拦截 | deepseek-v4.1-flash
 - 2026-11-20 10:52 | #006 | 有效期 | 新增 `auth.methods[0].authorize`：登录期校验 key 并写 `expires` + `expiresAt`（取最晚 grant expiresDate，退回 currentPeriodEnd），让网关「有效期」列显示真实日期；随即把账号名刷成 Meoo 显示名（原先被 uid 覆盖） | deepseek-v4.1-flash
 - 2026-11-20 11:10 | #007 | 修正 | 逐份到期的日期改塞进窗口名（`· MM-DD 到期`）并补 `resetsAt`：宿主 reports.mjs 的 label/window 都取 `row.name`，弹层只渲染 `resetsAt`；同时 `limit` 与 `balance` 同值 + `used: 0`，避免前端把整格降级成「部分读数未知」 | deepseek-v4.1-flash
+- 2026-11-20 11:16 | #008 | 修正 | 时区：Meoo 的时间串不带时区（北京本地时间），网关跑在 UTC 容器里，直接 `Date.parse` 会把每个到期日整体推后 8 小时、`23:59:59` 的几份跨日。改为解析前补 `+08:00`、标签按同一偏移格式化，与宿主及用户看到的中文时间一致 | deepseek-v4.1-flash

@@ -139,6 +139,11 @@ Notes and hard-won constraints:
    Rust providers only, script plugins cannot fill it.
 5. `long_lived` is hard-coded to `false` for every remote provider by the host's
    `models.mjs`, so the account is never labelled "长期有效" — it shows the real date.
+6. Meoo's timestamps are naive Beijing-time strings (`2026-12-19T00:00:00`). The plugin
+   appends `+08:00` before parsing, because the gateway runs in a UTC container and a
+   plain `Date.parse` would shift every due date by eight hours (and push
+   `23:59:59` grants into the next day). Labels use the same offset, so
+   `· 11-26 到期` and the drill-down reset time always agree.
 
 ## Known limitations
 
