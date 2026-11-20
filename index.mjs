@@ -55,19 +55,92 @@ const log = (...a) => { if (VERBOSE) console.log("[meoo-agent]", ...a); };
 
 // ---- 模型 ---------------------------------------------------------------------
 //
-// capabilities 拿不到时的兜底清单。上下文/输出是估算，Meoo 的
-// capabilities 不返回这两个字段（DeepSeek-V4-Pro 的 1M/384K 来自官方文档）。
+// 「能力同步」在这里只可能有两半，必须分清：
+//
+//   ① 模型清单 —— 真的能同步。provider.models() 调
+//      GET /open/v1/projects/{id}/agent/capabilities 拿到当前可用的模型列表
+//      与档位，上游加/删模型这里立刻跟着变。
+//
+//   ② 上下文窗口 / 输出上限 —— **同步不了**。那个接口只返回 {id, name}，
+//      没有 context、没有 max_output、没有模态、没有 tools；/open/v1/models、
+//      /agent/models、/models?detail=1、/me、/account、/entitlement 全是 404
+//      （2026-11-20 实测）。所以这两个数只能由本文件声明。
+//
+// 早先的写法是 known.get(m.id) 精确匹配，上游把 deepseek-v4.1-flash 改名成
+// deepseek-v4.1-flash-1017、把 kimi-k3 加了个 kimi-k3.1-pro 之后，新 ID 全
+// 落空 → 0 → 模型管理页整列「上游未声明」。现在改成按**归一化 ID** 查规格表：
+// 去 vendor 前缀（moonshot/、bigmodel/、MiniMax/、DeepSeek/）、折叠大小写与
+// 分隔符、去尾部 4 位日期戳（-1017 / -0813 / -0731）。以后同类改名不用改代码。
+//
+// 数值口径：家族默认（同门模型同一个窗口），不是上游声明。DeepSeek-V4-Pro 的
+// 1M/384K 来自官方文档；其余按各家公开的 200K/64K 档。要改单个模型，用环境变量
+//   MEOO_MODEL_SPECS='{"deepseek-v4.1-flash-1017":{"context":1000000,"output":384000}}'
+// 或直接在面板「模型能力」弹窗里覆盖（那里是本插件声明之上的覆盖层）。
 const MODELS = [
-  { id: "auto",                        name: "自动选择",        context: 0,       output: 0 },
-  { id: "qwen3.8-flash",               name: "Qwen 3.8 Flash",  context: 200_000, output: 64_000 },
-  { id: "qwen3.8-max",                 name: "Qwen 3.8 Max",    context: 200_000, output: 64_000 },
-  { id: "qwen3.7-max",                 name: "Qwen 3.7 Max",    context: 200_000, output: 64_000 },
-  { id: "qwen3.7-plus",                name: "Qwen 3.7 Plus",   context: 200_000, output: 64_000 },
-  { id: "DeepSeek/deepseek-v4.1-flash", name: "DeepSeek V4.1 Flash", context: 200_000, output: 64_000 },
-  { id: "deepseek-v4-pro-0813",        name: "DeepSeek V4 Pro",  context: 1_000_000, output: 384_000 },
-  { id: "moonshot/kimi-k3",            name: "Kimi K3",          context: 200_000, output: 64_000 },
-  { id: "bigmodel/glm-5.3",            name: "GLM-5.3",          context: 200_000, output: 64_000 },
+  { id: "auto",                        name: "自动选择" },
+  { id: "qwen4-max",                   name: "Qwen4-Max" },
+  { id: "qwen3.8-max",                 name: "Qwen3.8-Max" },
+  { id: "qwen3.8-flash",               name: "Qwen3.8-Flash" },
+  { id: "qwen3.7-max",                 name: "Qwen3.7-Max" },
+  { id: "qwen3.7-plus",                name: "Qwen3.7-Plus" },
+  { id: "deepseek-v4.1-flash-1017",    name: "DeepSeek V4.1 Flash" },
+  { id: "deepseek-v4-pro-0813",        name: "DeepSeek V4 Pro" },
+  { id: "deepseek-v4-flash-0731",      name: "DeepSeek V4 Flash" },
+  { id: "moonshot/kimi-k3.1-pro",      name: "Kimi K3.1 Pro" },
+  { id: "moonshot/kimi-k3",            name: "Kimi K3" },
+  { id: "MiniMax/MiniMax-M3.1-Flash",  name: "MiniMax M3.1 Flash" },
+  { id: "bigmodel/glm-5.3",            name: "GLM-5.3" },
+  { id: "bigmodel/glm-5.3-flash",      name: "GLM-5.3-Flash" },
+  { id: "glm-5.2-fast-preview",        name: "GLM-5.2-Fast" },
+  { id: "glm-5.2",                     name: "GLM-5.2" },
 ];
+
+const SPEC_DEFAULT = { context: 200_000, output: 64_000 };
+const SPEC = new Map(Object.entries({
+  "auto":                    [200_000, 64_000],
+  "qwen4-max":               [200_000, 64_000],
+  "qwen3.8-max":             [200_000, 64_000],
+  "qwen3.8-flash":           [200_000, 64_000],
+  "qwen3.7-max":             [200_000, 64_000],
+  "qwen3.7-plus":            [200_000, 64_000],
+  "deepseek-v4.1-flash":     [200_000, 64_000],   // 归一化后不带 -1017
+  "deepseek-v4-flash":       [200_000, 64_000],
+  "deepseek-v4-pro":         [1_000_000, 384_000],
+  "kimi-k3":                 [200_000, 64_000],
+  "kimi-k3.1-pro":           [200_000, 64_000],
+  "minimax-m3.1-flash":      [200_000, 64_000],
+  "glm-5.3":                 [200_000, 64_000],
+  "glm-5.3-flash":           [200_000, 64_000],
+  "glm-5.2":                 [200_000, 64_000],
+  "glm-5.2-fast-preview":    [200_000, 64_000],
+}).map(([key, [context, output]]) => [key, { context, output }]));
+
+// 归一化：小写 → 去 vendor 前缀 → 非 [a-z0-9.] 折叠成 - → 去尾部 4 位日期戳
+function specKey(id) {
+  return String(id ?? "")
+    .toLowerCase()
+    .replace(/^[^/]*\//, "")
+    .replace(/[^a-z0-9.]+/g, "-")
+    .replace(/-\d{4}$/, "")
+    .replace(/^-+|-+$/g, "");
+}
+
+// 环境变量覆盖（键可以是原 ID，也可以是归一化 ID）
+const SPEC_OVERRIDE = (() => {
+  try { return JSON.parse(process.env.MEOO_MODEL_SPECS || "{}") ?? {}; }
+  catch { return {}; }
+})();
+
+function specOf(id) {
+  const key = specKey(id);
+  const hit = SPEC_OVERRIDE[id] ?? SPEC_OVERRIDE[key] ?? SPEC.get(key) ?? SPEC_DEFAULT;
+  const context = Number(hit?.context);
+  const output = Number(hit?.output);
+  return {
+    context: Number.isFinite(context) && context > 0 ? context : SPEC_DEFAULT.context,
+    output: Number.isFinite(output) && output > 0 ? output : SPEC_DEFAULT.output,
+  };
+}
 
 function isChatModel(id) { return !/^claude/i.test(id); }
 
@@ -81,24 +154,30 @@ function splitTier(modelId) {
 
 // 给每个模型生成三个档位变体：<id>@fast / <id>@standard / <id>@deep
 function variantIds(m) {
+  // 上下文/输出在这里就解析好：上游只给 id+name，数值一律查规格表
+  const spec = specOf(m.id);
+  const context = m.context ?? spec.context;
+  const output = m.output ?? spec.output;
   return TIERS.map((t) => ({
     id: `${m.id}@${t}`,
     name: `${m.name ?? m.id} · ${TIER_LABEL[t]}`,
-    context: m.context ?? 0,
-    output: m.output ?? 0,
+    context,
+    output,
   }));
 }
 
 function configModel(m) {
+  const spec = specOf(m.id);
   return {
     name: m.name ?? m.id,
-    limit: { context: m.context ?? 0, output: m.output ?? 0 },
+    limit: { context: m.context ?? spec.context, output: m.output ?? spec.output },
     // Meoo 协议里没有 tools，如实标 false，免得客户端以为能函数调用
     tool_call: false,
   };
 }
 
 function runtimeModel(m) {
+  const spec = specOf(m.id);
   return {
     id: m.id,
     providerID: ID,
@@ -108,7 +187,7 @@ function runtimeModel(m) {
     headers: {},
     options: {},
     cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
-    limit: { context: m.context ?? 0, output: m.output ?? 0 },
+    limit: { context: m.context ?? spec.context, output: m.output ?? spec.output },
     capabilities: {
       temperature: false,          // Meoo 不收 temperature
       reasoning: false,
@@ -702,16 +781,8 @@ export async function MeooPlugin({ client } = {}) {
           const cap = await capabilities(auth.key, pid);
           const list = cap?.models ?? [];
           if (!list.length) return fallback();
-          const known = new Map(MODELS.map((m) => [m.id, m]));
-          return toVariants(list.map((m) => {
-            const k = known.get(m.id);
-            return {
-              id: m.id,
-              name: m.name ?? k?.name ?? m.id,
-              context: k?.context ?? 0,
-              output: k?.output ?? 0,
-            };
-          }));
+          // 上游只给 {id, name}：名字用上游的（品牌写法以它为准），数值走 specOf(id)
+          return toVariants(list.map((m) => ({ id: m.id, name: m.name ?? m.id })));
         } catch (e) {
           log("取模型目录失败，用兜底清单：", e.message);
           return fallback();
@@ -722,6 +793,6 @@ export async function MeooPlugin({ client } = {}) {
 }
 
 export const _internal = {
-  sseFrames, parseFrame, flatten, splitTier, variantIds, MODELS, TIERS, ID, API, WEB,
+  sseFrames, parseFrame, flatten, splitTier, variantIds, specOf, specKey, MODELS, SPEC, TIERS, ID, API, WEB,
   expiryOf, millis, usageOf, CLIENT_HEADER,
 };

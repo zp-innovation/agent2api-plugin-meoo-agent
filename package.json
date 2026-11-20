@@ -1,6 +1,6 @@
 {
   "name": "magpie-plugin-meoo-agent",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "private": true,
   "description": "Meoo（秒悟）建站 Agent 作为 magpie / agent2api provider：在 auth.loader 的 fetch 里把 OpenAI chat completion 翻译成 Meoo 的 Agent Run + SSE，并上报积分余额与有效期",
   "type": "module",
