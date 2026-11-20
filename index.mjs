@@ -548,7 +548,29 @@ function usageOf(data) {
   if (!windows.length) {
     return { windows: [], empty: true, emptyText: plan ? `${plan} 账号没有可用积分` : "Meoo 没有返回积分余额" };
   }
-  return { windows, ...(plan ? { plan, until: until || undefined } : {}) };
+
+  // 顶层 balance 才是「可用合计」的取数口：宿主 reports.mjs:37 把 value.balance 归一成
+  // available（脚本插件拿不到 Rust 侧那条 totalLeft），前端 accounts-usage-group.tsx:104
+  // 用 totalLeft ?? available 决定这一组是「可用合计（绝对值求和）」还是「可用最低（比例）」。
+  // 不报这一项时 meoo 只能走百分比分支 —— 面板上那一列就是空的。
+  // 主余额读不到时才退到「逐份积分剩余之和」，两者都不伪造。
+  const total = balance !== null
+    ? balance
+    : (() => {
+        let sum = 0, found = false;
+        for (const grant of data?.userPointInfo?.activeGrants ?? []) {
+          for (const detail of grant?.grantDetails ?? []) {
+            if (Number.isFinite(detail?.remainingAmount)) { sum += detail.remainingAmount; found = true; }
+          }
+        }
+        return found ? sum : null;
+      })();
+
+  return {
+    windows,
+    ...(total !== null ? { balance: total, unit: "积分" } : {}),
+    ...(plan ? { plan, until: until || undefined } : {}),
+  };
 }
 
 async function usage(getAuth, sync) {
