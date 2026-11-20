@@ -8,6 +8,11 @@
 //
 // 契约参考 @magpie-community/opencode-commandcode-auth（同样在 fetch 里改协议）。
 //
+// 另外两个钩子（余额 / 有效期）：
+//   auth.usage            查网页控制面的 /api/mc/entitlement/get，报积分余额与逐份到期
+//   auth.methods[].authorize  登录期校验 key，并把真实到期时刻写进账号的 expiresAt
+// 这两条都要求 X-Meoo-Client: cli —— Open API 本身没有任何账单端点。
+//
 // 已知限制（务必知情）：
 //   - 它不是模型，是「建站 Agent」：带项目上下文、会调工具、会往那个项目里写文件
 //   - 慢：一次 Run 是分钟级（deep 档更久）
