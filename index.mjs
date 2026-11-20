@@ -189,6 +189,14 @@ async function web(key, path, { signal } = {}) {
   return json;
 }
 
+// Meoo 的 401 文案不总是给用户看的（写过格式不对的 key 时它回
+// NEED_LOGIN /「未登录」，看起来像插件没登录，其实是 key 本身不被接受）。
+// 带上错误码，至少让用户知道该去换一把 key 而不是怀疑插件。
+function rejectText(e) {
+  const message = e?.message || "Meoo 拒绝了这把 API Key";
+  return e?.code ? `${message}（${e.code}）` : message;
+}
+
 // Meoo 给的时间是**不带时区的北京时间串**（"2026-12-19T00:00:00"）。
 // 直接 Date.parse 会按「运行环境的本地时区」解释 —— 网关跑在容器里通常是
 // UTC，于是 12-19 00:00 会被算成北京时间 12-19 08:00，到期日整整晚 8 小时，
@@ -252,7 +260,7 @@ async function authorize(inputs, { signal } = {}) {
     // 401 是「key 不对」，其余（网络、5xx）不该把用户的 key 判死：
     // 仍然允许保存，只是这次拿不到有效期。
     if (e?.status === 401 || e?.status === 403) {
-      return { type: "failed", error: e.message || "Meoo 拒绝了这把 API Key" };
+      return { type: "failed", error: rejectText(e) };
     }
     log("登录期查询权益失败，先保存凭据：", e.message);
     const who = await identify(key, signal);
@@ -463,7 +471,7 @@ async function usage(getAuth, sync) {
     body = await web(auth.key, "/api/mc/entitlement/get");
   } catch (e) {
     // 401 = key 被吊销/过期：让网关把账号标成「需重新登录」，而不是一条普通查询失败。
-    if (e?.status === 401) return { signIn: "expired", error: e.message };
+    if (e?.status === 401) return { signIn: "expired", error: rejectText(e) };
     return { error: `Meoo 权益查询失败：${e.message}` };
   }
   if (body?.success === false) return { error: body?.error?.message || "Meoo 未返回权益" };
