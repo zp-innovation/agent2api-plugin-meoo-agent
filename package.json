@@ -1,6 +1,6 @@
 {
   "name": "magpie-plugin-meoo-agent",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Meoo（秒悟）建站 Agent 作为 magpie / agent2api provider：在 auth.loader 的 fetch 里把 OpenAI chat completion 翻译成 Meoo 的 Agent Run + SSE，并上报积分余额与有效期",
   "type": "module",
@@ -14,6 +14,9 @@
     "openai-compatible"
   ],
   "license": "MIT",
+  "magpie": {
+    "icon": "https://gw.alicdn.com/imgextra/i4/O1CN01MxUXzS1xYRjMwA2la_!!6000000006455-2-tps-184-184.png"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/RexVane/magpie-plugin-meoo-agent.git"
