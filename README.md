@@ -37,7 +37,7 @@ bun add github:zp-innovation/agent2api-plugin-meoo-agent
 then add to `~/.config/magpie/plugins.json`:
 
 ```json
-{ "spec": "magpie-plugin-meoo-agent" }
+{ "spec": "agent2api-plugin-meoo-agent" }
 ```
 
 **Provider id:** `meoo-agent`.

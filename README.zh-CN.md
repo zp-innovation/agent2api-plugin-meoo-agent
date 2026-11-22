@@ -1,6 +1,6 @@
 # agent2api-plugin-meoo-agent
 
-> 包名（`package.json` 的 `name`）仍是 `magpie-plugin-meoo-agent`，显示名由 `magpie.name` 指定为 `agent2api-plugin-meoo-agent`。
+> 包名（`package.json` 的 `name`）自 0.7.1 起为 `agent2api-plugin-meoo-agent`，与显示名一致；旧版（≤0.7.0）包名为 `magpie-plugin-meoo-agent`。
 
 [English](README.md) · [简体中文](README.zh-CN.md)
 
@@ -39,7 +39,7 @@ bun add github:zp-innovation/agent2api-plugin-meoo-agent
 然后在 `~/.config/magpie/plugins.json` 里加：
 
 ```json
-{ "spec": "magpie-plugin-meoo-agent" }
+{ "spec": "agent2api-plugin-meoo-agent" }
 ```
 
 **Provider id：** `meoo-agent`。
