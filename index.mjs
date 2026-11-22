@@ -21,6 +21,12 @@ const TOKEN_EARLY_MS = 60 * 1000;
 const tokenRenewals = new Map();
 const tokenCache = new Map();
 
+const ID = "meoo-agent";
+const SITE = "https://meoo.com";
+const API = `${SITE}/open/v1`;
+const WEB = SITE;
+const CHAT = "@ai-sdk/openai-compatible";
+
 const b64url = (bytes) => Buffer.from(bytes).toString("base64url");
 
 async function tokenRequest(params, { signal } = {}) {
@@ -1059,6 +1065,6 @@ export async function MeooPlugin({ client } = {}) {
 }
 
 export const _internal = {
-  sseFrames, parseFrame, flatten, splitTier, variantIds, specOf, specKey, MODELS, SPEC, TIERS, ID, API, WEB,
+  parseFrame, flatten, splitTier, variantIds, specOf, specKey, MODELS, SPEC, TIERS, ID, API, WEB,
   expiryOf, millis, usageOf, CLIENT_HEADER,
 };
