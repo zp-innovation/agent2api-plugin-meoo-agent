@@ -495,6 +495,30 @@ function expiryOf(data) {
   return latest;
 }
 
+// WorkBuddy 式倒计时只认 credits[].expireAt（毫秒绝对时刻）。
+// Meoo 的余额是 account.availableBalance，逐份积分在 activeGrants[].grantDetails[]；
+// 不把总余额再复制成一条 credits 行，避免与真实批次重复计时。
+function expiryCreditsOf(data) {
+  const rows = [];
+  for (const grant of data?.userPointInfo?.activeGrants ?? []) {
+    const label = grant?.sourceTypeName || grant?.sourceType || "积分";
+    for (const detail of grant?.grantDetails ?? []) {
+      const remain = Number(detail?.remainingAmount);
+      const expireAt = millis(detail?.expiresDate);
+      if (!Number.isFinite(remain) || remain <= 0 || !expireAt) continue;
+      rows.push({ name: String(label), remain, unit: "积分", expireAt });
+    }
+  }
+  if (!rows.length) {
+    const remain = Number(data?.userPointInfo?.account?.availableBalance);
+    const expireAt = millis(data?.currentPeriodEnd);
+    if (Number.isFinite(remain) && remain > 0 && expireAt) {
+      rows.push({ name: "积分余额", remain, unit: "积分", expireAt });
+    }
+  }
+  return rows;
+}
+
 async function identify(key, signal) {
   try {
     const me = await web(key, "/api/v1/user/me", { signal });
@@ -664,70 +688,18 @@ async function drive(key, projectId, runId, signal, onDelta) {
 }
 
 // ---- 余额 / 有效期（auth.usage 的返回形状）-------------------------------------
-//
-// 网关 reports.mjs 只透传这些键（没有 credits[] 顶层字段），所以「积分明细」
-// 只能落到 windows[] 上：一条总余额 + 每份积分一条到期行。
-// 注意 windows[].used 在网关里是**百分比**（100-used = 剩余百分比），不是用量。
-
-// 标签上的日期必须与 Meoo 写的那一天一致，所以按北京时间取年月日，
-// 不用 getMonth()/getDate()（那会跟着进程 TZ 走，容器里是 UTC 就会差一天）。
-const MD = (value) => {
-  const at = millis(value);
-  if (!at) return "";
-  const d = new Date(at + CN_OFFSET);
-  return `${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
-};
 
 function usageOf(data) {
+  // 只报一条胶囊（与 WorkBuddy/AutoClaw 相同口径）：顶层 balance -> 宿主
+  // available，外加 credits[] 到期批次。不报 windows[]/plan —— 报了就会触发
+  // UI 的「分窗口额度」分支和「额度充足/领取明细」弹层（用户 m04153 明确不要）。
+  // 限流兜底照旧走上游 429（WorkBuddy/AutoClaw 同样不报 windows）。
   const account = data?.userPointInfo?.account ?? {};
   const balance = Number.isFinite(account.availableBalance) ? account.availableBalance : null;
-  const granted = Number.isFinite(account.totalGranted) ? account.totalGranted : null;
-
-  const windows = [];
-  if (balance !== null) {
-    // limit 与 balance 一起报：网关用 balance 定「剩余」，用 used 定百分比。
-    // 千万不要在这条上报 0 —— allowance.mjs 会据此真拦截转发。
-    const percent = granted && granted > 0 ? Math.max(0, Math.min(100, (100 * (granted - balance)) / granted)) : null;
-    windows.push({
-      name: "积分余额", group: "积分", window: "当前积分",
-      limit: granted ?? undefined, balance, used: percent ?? undefined,
-      unit: "积分", resetsAt: millis(data?.currentPeriodEnd) || undefined,
-    });
-  }
-  for (const grant of data?.userPointInfo?.activeGrants ?? []) {
-    const label = grant?.sourceTypeName || grant?.sourceType || "积分";
-    for (const detail of grant?.grantDetails ?? []) {
-      const amount = Number.isFinite(detail?.remainingAmount) ? detail.remainingAmount : null;
-      if (amount === null) continue;
-      const at = millis(detail?.expiresDate);
-      const date = MD(detail?.expiresDate);
-      windows.push({
-        // 日期只能写进 name：网关 reports.mjs 的 label 与 window 都取 row.name
-        // （它根本读不到 row.window），而弹层又只渲染 resetsAt。
-        name: date ? `${label} · ${date} 到期` : `${label} · 未注明到期`,
-        group: "积分到期",
-        // 这份积分还剩多少 = balance；limit 同值 + used:0 只为让
-        // remainingPercent 算得出 100（否则前端状态从「额度充足」掉成
-        // 「部分读数未知」，见 accounts-usage-windows.tsx:141）。
-        limit: amount, balance: amount, used: 0, unit: "积分",
-        // aside 让 allowance.mjs:5-12 跳过这条：逐份积分的到期不等于
-        // 「现在就不能用了」，参与拦截会把一次正常请求误判成配额耗尽。
-        aside: true,
-        resetsAt: at || undefined,
-      });
-    }
-  }
-
-  const plan = typeof data?.planName === "string" ? data.planName.trim() : "";
-  const until = millis(data?.currentPeriodEnd);
-  if (!windows.length) {
-    return { windows: [], empty: true, emptyText: plan ? `${plan} 账号没有可用积分` : "Meoo 没有返回积分余额" };
-  }
 
   // 顶层 balance 才是「可用合计」的取数口：宿主 reports.mjs:37 把 value.balance 归一成
   // available（脚本插件拿不到 Rust 侧那条 totalLeft），前端 accounts-usage-group.tsx:104
   // 用 totalLeft ?? available 决定这一组是「可用合计（绝对值求和）」还是「可用最低（比例）」。
-  // 不报这一项时 meoo 只能走百分比分支 —— 面板上那一列就是空的。
   // 主余额读不到时才退到「逐份积分剩余之和」，两者都不伪造。
   const total = balance !== null
     ? balance
@@ -741,10 +713,15 @@ function usageOf(data) {
         return found ? sum : null;
       })();
 
+  if (total === null) {
+    return { empty: true, emptyText: "Meoo 没有返回积分余额" };
+  }
+
+  const credits = expiryCreditsOf(data);
   return {
-    windows,
-    ...(total !== null ? { balance: total, unit: "积分" } : {}),
-    ...(plan ? { plan, until: until || undefined } : {}),
+    balance: total,
+    unit: "积分",
+    ...(credits.length ? { credits } : {}),
   };
 }
 
@@ -753,36 +730,29 @@ async function usage(getAuth, sync) {
   if (!auth) return { signIn: "expired", error: "meoo-agent：未登录" };
   if (auth.type === "oauth") {
     try {
-      const [points, entitlement] = await Promise.all([
-        controlCall(auth, "/open/v1/cli-compat/account/points"),
-        controlCall(auth, "/open/v1/cli-compat/account/entitlement").catch(() => null),
-      ]);
+      const points = await controlCall(auth, "/open/v1/cli-compat/account/points");
       const acc = points?.account ?? {};
       const left = Number(acc.availableBalance);
-      const used = Number(acc.totalConsumed);
-      const fmt = (n) => new Intl.NumberFormat("en-US").format(n);
-      const windows = [];
-      if (Number.isFinite(left)) windows.push({ name: "积分", balance: left, unit: "积分", display: fmt(left) + " 积分" });
-      if (Number.isFinite(used) && used > 0) windows.push({ name: "已用", display: fmt(used) + " 积分", aside: true });
       const grants = Array.isArray(points?.activeGrants) ? points.activeGrants : [];
       const upcoming = grants
         .flatMap((g) => Array.isArray(g?.grantDetails) && g.grantDetails.length ? g.grantDetails : [g])
         .map((d) => millis(d?.expireTime ?? d?.expiresAt ?? d?.expiryAt ?? d?.endAt ?? d?.expiresDate))
         .filter((n) => Number.isFinite(n) && n > Date.now())
         .sort((a, b) => a - b)[0];
-      if (upcoming && windows[0]) windows[0].runsOutAt = upcoming;
-      const daily = Array.isArray(entitlement?.benefits)
-        ? entitlement.benefits.find((x) => x?.typeCode === "daily_login" || x?.typeName === "每日登录赠送积分")
-        : null;
-      if (daily) {
-        const q = Number(daily.quota);
-        const amount = q === -1 ? "不限" : fmt(Number.isFinite(q) ? q : 0) + " " + (daily.unit || "积分") + "/日";
-        const granted = entitlement?.dailyLoginGranted === true ? " · 今日已到账" : "";
-        windows.push({ name: "每日登录", display: amount + granted, aside: true });
+      const credits = [];
+      for (const g of grants) {
+        const label = g?.sourceTypeName || g?.sourceType || "积分";
+        const details = Array.isArray(g?.grantDetails) && g.grantDetails.length ? g.grantDetails : [g];
+        for (const d of details) {
+          const remain = Number(d?.remainingAmount ?? d?.remain ?? d?.balance);
+          const expireAt = millis(d?.expireTime ?? d?.expiresAt ?? d?.expiryAt ?? d?.endAt ?? d?.expiresDate);
+          if (!Number.isFinite(remain) || remain <= 0 || !expireAt) continue;
+          credits.push({ name: String(label), remain, unit: "积分", expireAt });
+        }
       }
       const report = {
         ...(Number.isFinite(left) ? { balance: left, unit: "积分" } : {}),
-        ...(windows.length ? { windows } : {}),
+        ...(credits.length ? { credits } : {}),
       };
       const who = await oauthIdentity(auth.access || auth.refresh || "");
       if (upcoming) await sync?.(upcoming, who);
@@ -941,6 +911,11 @@ export async function MeooPlugin({ client } = {}) {
   return {
     auth: {
       provider: ID,
+      // 让脚本宿主在 /api/session 的 accountFeatures 中下发积分明细/倒计时能力。
+      credit_detail: true,
+      credit_expiry: true,
+      // 新镜像宿主从 accountFeatures 读取；两边都声明以兼容新旧宿主。
+      accountFeatures: { creditDetail: true, creditExpiry: true },
       // 宿主的 loader.mjs:102 `icon(hooks.auth.icon)` 收下它；内嵌 data: 走
       // icons/formats.rs 的 inline()，解 base64 + 验魔数 + 按 sha256 落盘，
       // 全程不碰 DNS。前端从 /api/session 的 providerIcons 拿到
@@ -1026,7 +1001,7 @@ export async function MeooPlugin({ client } = {}) {
       config.provider ??= {};
       const was = config.provider[ID] ?? {};
       config.provider[ID] = {
-        name: "Meoo 秒悟（建站 Agent）",
+        name: "Meoo · ZP",
         npm: CHAT,
         api: API,
         ...was,
@@ -1066,5 +1041,5 @@ export async function MeooPlugin({ client } = {}) {
 
 export const _internal = {
   parseFrame, flatten, splitTier, variantIds, specOf, specKey, MODELS, SPEC, TIERS, ID, API, WEB,
-  expiryOf, millis, usageOf, CLIENT_HEADER,
+  expiryOf, expiryCreditsOf, millis, usageOf, CLIENT_HEADER,
 };
