@@ -1001,7 +1001,7 @@ export async function MeooPlugin({ client } = {}) {
       config.provider ??= {};
       const was = config.provider[ID] ?? {};
       config.provider[ID] = {
-        name: "Meoo · ZP",
+        name: "Meoo · zp",
         npm: CHAT,
         api: API,
         ...was,
