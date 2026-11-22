@@ -42,8 +42,12 @@ bun add github:zp-innovation/agent2api-plugin-meoo-agent
 { "spec": "magpie-plugin-meoo-agent" }
 ```
 
-**Provider id：** `meoo-agent` · **认证方式：** `API key` —— 在
-[meoo.com](https://meoo.com) → 设置 → API 密钥 建一把 `meoo_ak_...`。
+**Provider id：** `meoo-agent`。
+
+认证方式（添加账号时二选一）：
+
+- **浏览器授权登录（含 API key，推荐）** —— 浏览器走 Meoo OAuth/PKCE 登录，插件開本机 loopback 接回 callback，自动刷新 access token；同时仍需填一把 `meoo_ak_...` API Key。原因见下方「浏览器授权（OAuth）」。
+- **API key** —— 只在 [meoo.com](https://meoo.com) → 设置 → API 密钥 建一把 `meoo_ak_...`。
 
 ### 在 Agent2API 里用
 
@@ -54,6 +58,18 @@ provider 入口，`auth.loader` / `auth.usage` / `auth.methods[].authorize` 都�
 
 装好后账号页会多出两列真实读数：「余额」显示积分余额与逐份到期，「有效期」显示套餐周期到期日
 （见下节）。
+
+## 浏览器授权（OAuth）
+
+Agent2API 脚本插件（需支持动态登录方法的宿主版本）在「添加账号」里新增 **浏览器授权登录（含 API key，推荐）**。它走 Meoo 的 OAuth Authorization Code + PKCE：
+
+1. 先填一把 `meoo_ak_...` API Key；插件会先用它校验权益接口。这个 Key 仍用于 `/open/v1/projects/{id}/agent/runs`，因为公开协议里没有「OAuth access token / project service AK → 用户 API Key」的转换接口。
+2. 插件在 `127.0.0.1` 临时监听一个随机端口，宿主打开 `https://meoo.com/oauth/authorize`，浏览器登录后回跳本机 `/oauth/callback`。
+3. 宿主把 callback URL 回传给插件，插件换出 access/refresh token，并读取身份与积分余额。access token 会在到期前由宿主自动刷新；refresh token 轮换时也自动更新。
+
+**每天登录送积分**：这是浏览器登录态本身触发的，不是独立签到按钮。浏览器授权成功相当于当天登录一次；API key 方法不会触发。插件不会调用所谓「签到」接口，也没有可靠的签到端点可调用（公开协议验证中所有候选签到路径都是 404）。需要每日积分时，用浏览器登录一次即可，插件不代签。
+
+老的 API key 登录方式完整保留，不擅长/不方便开浏览器时仍可继续用。
 
 ## 档位：做成模型变体
 

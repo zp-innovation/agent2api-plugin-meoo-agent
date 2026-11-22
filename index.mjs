@@ -1,38 +1,207 @@
-// meoo-agent — Meoo（秒悟）的建站 Agent，作为 magpie 插件接入。
-//
-// 为什么需要翻译层：Meoo 的 Open API 没有 chat completions。它只有
-//   建项目 → 起一次 Agent Run → 订阅 SSE 事件流
-// 这个插件在 auth.loader 返回的 fetch 里做翻译：
-//   把 magpie 发来的 chat completion 改写成一次 Run，
-//   再把 SSE 里的 message.delta / message.snapshot 拼回 chat completion。
-//
-// 契约参考 @magpie-community/opencode-commandcode-auth（同样在 fetch 里改协议）。
-//
-// 另外两个钩子（余额 / 有效期）：
-//   auth.usage            查网页控制面的 /api/mc/entitlement/get，报积分余额与逐份到期
-//   auth.methods[].authorize  登录期校验 key，并把真实到期时刻写进账号的 expiresAt
-// 这两条都要求 X-Meoo-Client: cli —— Open API 本身没有任何账单端点。
-//
-// 已知限制（务必知情）：
-//   - 它不是模型，是「建站 Agent」：带项目上下文、会调工具、会往那个项目里写文件
-//   - 慢：一次 Run 是分钟级（deep 档更久）
-//   - 按积分计费，不是 token
-//   - temperature / max_tokens / tools / 函数调用 会被忽略（Meoo 协议里没这些字段）
-//   - Meoo 文档写明这把 key「不能作为绕过团队系统集成和集成版权益套餐的方式」
-
-const ID = "meoo-agent";
-const SITE = "https://meoo.com";
-const API = `${SITE}/open/v1`;
-// 网页控制面（积分 / 有效期只在这里，Open API 没有对应端点）
-const WEB = SITE;
-const CHAT = "@ai-sdk/openai-compatible";
-const FELL_BACK = Symbol.for("magpie.fellBack");
 
 // Meoo 的 API Key 只对「CLI 身份」开放网页控制面接口。缺这个头时
 // /api/mc/* 与 /api/v1/* 一律 401 API_KEY_CLIENT_REQUIRED；写成
 // X-Client-Type、User-Agent: meoo-cli 之类都无效（实测）。加上它不影
 // 响 /open/v1（同一把 key 仍能建项目、起 Run）。
 const CLIENT_HEADER = { "X-Meoo-Client": "cli" };
+
+// Browser OAuth (PKCE) is only used to verify the account and refresh web login state.
+// Meoo Agent Run still needs a meoo_ak_ API Key: no public endpoint exchanges OAuth
+// tokens for that key, and project service AKs are not proven for /agent/runs.
+import { createHash, randomBytes } from "node:crypto";
+import { createServer } from "node:http";
+
+const OAUTH_CLIENT_ID = "meoo_app_tdWlRbpvAxN1EjmZ8XICxdTh";
+const OAUTH_SCOPE = "cli.compat";
+const OAUTH_CALLBACK_PATH = "/oauth/callback";
+const OAUTH_TIMEOUT_MS = 10 * 60 * 1000;
+const OAUTH_CLI_HEADERS = { ...CLIENT_HEADER, "x-meoo-cli-version": "0.5.6" };
+const REFRESH_LEAD_MS = 5 * 60 * 1000;
+const TOKEN_EARLY_MS = 60 * 1000;
+const tokenRenewals = new Map();
+const tokenCache = new Map();
+
+const b64url = (bytes) => Buffer.from(bytes).toString("base64url");
+
+async function tokenRequest(params, { signal } = {}) {
+  const res = await fetch(`${SITE}/oauth/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded", ...OAUTH_CLI_HEADERS },
+    body: new URLSearchParams(params),
+    signal: signal ?? AbortSignal.timeout(20_000),
+  });
+  const text = await res.text();
+  let json = null;
+  try { json = text ? JSON.parse(text) : null; } catch {}
+  if (!res.ok || json?.error) {
+    const e = new Error(json?.error_description || json?.error || text.slice(0, 200) || `HTTP ${res.status}`);
+    e.status = res.status;
+    throw e;
+  }
+  if (typeof json?.access_token !== "string" || !json.access_token) throw new Error("Meoo OAuth 响应没有 access_token");
+  return json;
+}
+
+async function renewOAuth(auth, { force = false, signal } = {}) {
+  const refresh = typeof auth?.refresh === "string" ? auth.refresh : "";
+  if (!refresh) {
+    if (!force && typeof auth?.access === "string" && auth.access
+      && Number.isFinite(auth.expires) && auth.expires > Date.now() + TOKEN_EARLY_MS) return auth;
+    const e = new Error("Meoo 登录态已过期且没有 refresh token，请重新登录");
+    e.signIn = "expired";
+    throw e;
+  }
+  if (!force && Number.isFinite(auth.expires) && auth.expires > Date.now() + TOKEN_EARLY_MS) return auth;
+  const hit = tokenCache.get(refresh);
+  if (!force && hit && Date.now() - hit.at < TOKEN_EARLY_MS) return { ...auth, ...hit.next };
+  let pending = tokenRenewals.get(refresh);
+  if (!pending) {
+    pending = (async () => {
+      const token = await tokenRequest({ grant_type: "refresh_token", client_id: OAUTH_CLIENT_ID, refresh_token: refresh }, { signal });
+      const next = {
+        access: token.access_token,
+        refresh: token.refresh_token || refresh,
+        expires: Date.now() + (Number(token.expires_in) || 3600) * 1000,
+        ...(token.scope ? { scope: token.scope } : {}),
+        ...(token.openid ? { openid: token.openid } : {}),
+      };
+      tokenCache.set(refresh, { at: Date.now(), next });
+      tokenCache.set(next.refresh, { at: Date.now(), next });
+      return next;
+    })().finally(() => tokenRenewals.delete(refresh));
+    tokenRenewals.set(refresh, pending);
+  }
+  const next = await pending;
+  return { ...auth, ...next };
+}
+
+async function controlCall(auth, path, { signal } = {}) {
+  let current = await renewOAuth(auth, { signal });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const res = await fetch(SITE + path, {
+      headers: { Authorization: `Bearer ${current.access}`, ...OAUTH_CLI_HEADERS, Accept: "application/json" },
+      signal,
+    });
+    const text = await res.text();
+    let json = null;
+    try { json = text ? JSON.parse(text) : null; } catch {}
+    if (res.status === 401 && attempt === 0) { current = await renewOAuth(current, { force: true, signal }); continue; }
+    if (!res.ok) {
+      const e = new Error(json?.error?.message || json?.message || `Meoo ${path} -> ${res.status}`);
+      e.status = res.status;
+      throw e;
+    }
+    if (json?.success === false) throw new Error(json?.error?.message || "Meoo 控制面拒绝请求");
+    return json?.data ?? json ?? {};
+  }
+  throw new Error("Meoo 控制面登录态失效，请重新登录");
+}
+
+async function oauthIdentity(access, signal) {
+  try {
+    const res = await fetch(SITE + "/open/v1/cli-compat/account/identity", {
+      headers: { Authorization: `Bearer ${access}`, ...OAUTH_CLI_HEADERS, Accept: "application/json" },
+      signal: signal ?? AbortSignal.timeout(20_000),
+    });
+    if (!res.ok) return {};
+    const json = await res.json();
+    const d = json?.data ?? json ?? {};
+    const name = d.name ?? d.username ?? "";
+    const uid = d.user_id ?? d.userId ?? d.id ?? d.openid ?? "";
+    return { ...(uid ? { uid: String(uid) } : {}), ...(d.email ? { email: d.email } : {}), ...(name ? { name } : {}) };
+  } catch { return {}; }
+}
+
+// Browser authorization uses a loopback server. The host opens the browser and relays the
+// callback URL back to the plugin; credentials are never written to a plugin-owned file.
+async function browserOAuth(inputs, { signal } = {}) {
+  const apiKey = typeof inputs?.key === "string" ? inputs.key.trim() : "";
+  if (!apiKey) return { type: "failed", error: "请同时填写 Meoo API Key（meoo_ak_…），Agent Run 仍需要它" };
+  try {
+    await web(apiKey, "/api/mc/entitlement/get", { signal });
+  } catch (e) {
+    if (e?.status === 401 || e?.status === 403) return { type: "failed", error: `API Key 无效：${rejectText(e)}` };
+  }
+  const verifier = b64url(randomBytes(32));
+  const state = b64url(randomBytes(32));
+  const challenge = b64url(createHash("sha256").update(verifier).digest());
+  let resolveCode;
+  let rejectCode;
+  let done = false;
+  let server = null;
+  let origin = "";
+  const completion = new Promise((res, rej) => { resolveCode = res; rejectCode = rej; });
+  const cleanup = () => { try { server?.close(); } catch {} };
+  const fail = (err) => { if (done) return; done = true; cleanup(); rejectCode(err); };
+  server = createServer((req, res) => {
+    let url;
+    try { url = new URL(req.url, origin); } catch { res.writeHead(400).end(); return; }
+    if (url.pathname !== OAUTH_CALLBACK_PATH || url.searchParams.get("state") !== state) {
+      res.writeHead(400).end("Invalid OAuth callback");
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end("Meoo 授权完成，可以关闭本窗口。");
+    if (!done) { done = true; resolveCode(url.searchParams.get("code") || ""); }
+  });
+  await new Promise((res, rej) => server.once("error", rej).listen(0, "127.0.0.1", res));
+  const address = server.address();
+  if (!address || typeof address === "string") { cleanup(); throw new Error("无法启动 OAuth 本机回调服务"); }
+  origin = `http://127.0.0.1:${address.port}`;
+  const redirectUri = origin + OAUTH_CALLBACK_PATH;
+  const timer = setTimeout(() => fail(new Error("Meoo 登录超时，请重新登录")), OAUTH_TIMEOUT_MS);
+  signal?.addEventListener("abort", () => fail(new Error("已取消 Meoo 浏览器授权")), { once: true });
+  const authorizeUrl = new URL("/oauth/authorize", SITE);
+  authorizeUrl.searchParams.set("client_id", OAUTH_CLIENT_ID);
+  authorizeUrl.searchParams.set("redirect_uri", redirectUri);
+  authorizeUrl.searchParams.set("response_type", "code");
+  authorizeUrl.searchParams.set("scope", OAUTH_SCOPE);
+  authorizeUrl.searchParams.set("state", state);
+  authorizeUrl.searchParams.set("code_challenge", challenge);
+  authorizeUrl.searchParams.set("code_challenge_method", "S256");
+  return {
+    url: authorizeUrl.href,
+    method: "auto",
+    instructions: "在浏览器完成 Meoo 登录授权；随后仍需保存你填写的 meoo_ak_ API Key，才能调用建站 Agent。浏览器登录会触发「每天登录送积分」，插件不代签。",
+    async callback(raw, options) {
+      try {
+        let code = "";
+        if (typeof raw === "string" && raw) {
+          try {
+            const u = new URL(raw);
+            code = u.searchParams.get("code") || "";
+            const gotState = u.searchParams.get("state") || "";
+            if (gotState && gotState !== state) throw new Error("回调地址与当前登录任务不匹配");
+          } catch (e) {
+            if (e?.message === "回调地址与当前登录任务不匹配") throw e;
+            code = raw;
+          }
+        } else code = await completion;
+        if (!code) throw new Error("Meoo 浏览器授权没有返回 code");
+        const token = await tokenRequest({
+          grant_type: "authorization_code",
+          client_id: OAUTH_CLIENT_ID,
+          redirect_uri: redirectUri,
+          code,
+          code_verifier: verifier,
+        }, { signal: options?.signal });
+        const access = token.access_token;
+        const who = await oauthIdentity(access, options?.signal);
+        return {
+          type: "success",
+          access,
+          refresh: token.refresh_token || "",
+          expires: Date.now() + (Number(token.expires_in) || 3600) * 1000,
+          key: apiKey,
+          ...who,
+          scope: token.scope || OAUTH_SCOPE,
+          ...(token.openid ? { openid: token.openid } : {}),
+          ...(token.id_token ? { idToken: token.id_token } : {}),
+        };
+      } finally { clearTimeout(timer); cleanup(); }
+    },
+  };
+}
 
 // 官方 logo（内嵌 data:image/png;base64，原因与尺寸约束见 icon.mjs 顶部注释）。
 // 用 https 地址在这台网关上永远不会成功：容器 DNS 是 fake-ip，公网域名一律
@@ -575,7 +744,49 @@ function usageOf(data) {
 
 async function usage(getAuth, sync) {
   const auth = await getAuth();
-  if (auth?.type !== "api" || !auth.key) return { signIn: "expired", error: "meoo-agent：未登录" };
+  if (!auth) return { signIn: "expired", error: "meoo-agent：未登录" };
+  if (auth.type === "oauth") {
+    try {
+      const [points, entitlement] = await Promise.all([
+        controlCall(auth, "/open/v1/cli-compat/account/points"),
+        controlCall(auth, "/open/v1/cli-compat/account/entitlement").catch(() => null),
+      ]);
+      const acc = points?.account ?? {};
+      const left = Number(acc.availableBalance);
+      const used = Number(acc.totalConsumed);
+      const fmt = (n) => new Intl.NumberFormat("en-US").format(n);
+      const windows = [];
+      if (Number.isFinite(left)) windows.push({ name: "积分", balance: left, unit: "积分", display: fmt(left) + " 积分" });
+      if (Number.isFinite(used) && used > 0) windows.push({ name: "已用", display: fmt(used) + " 积分", aside: true });
+      const grants = Array.isArray(points?.activeGrants) ? points.activeGrants : [];
+      const upcoming = grants
+        .flatMap((g) => Array.isArray(g?.grantDetails) && g.grantDetails.length ? g.grantDetails : [g])
+        .map((d) => millis(d?.expireTime ?? d?.expiresAt ?? d?.expiryAt ?? d?.endAt ?? d?.expiresDate))
+        .filter((n) => Number.isFinite(n) && n > Date.now())
+        .sort((a, b) => a - b)[0];
+      if (upcoming && windows[0]) windows[0].runsOutAt = upcoming;
+      const daily = Array.isArray(entitlement?.benefits)
+        ? entitlement.benefits.find((x) => x?.typeCode === "daily_login" || x?.typeName === "每日登录赠送积分")
+        : null;
+      if (daily) {
+        const q = Number(daily.quota);
+        const amount = q === -1 ? "不限" : fmt(Number.isFinite(q) ? q : 0) + " " + (daily.unit || "积分") + "/日";
+        const granted = entitlement?.dailyLoginGranted === true ? " · 今日已到账" : "";
+        windows.push({ name: "每日登录", display: amount + granted, aside: true });
+      }
+      const report = {
+        ...(Number.isFinite(left) ? { balance: left, unit: "积分" } : {}),
+        ...(windows.length ? { windows } : {}),
+      };
+      const who = await oauthIdentity(auth.access || auth.refresh || "");
+      if (upcoming) await sync?.(upcoming, who);
+      return { ...report, ...(who.name || who.email ? { user: who.name || who.email } : {}) };
+    } catch (e) {
+      if (e?.signIn === "expired" || e?.status === 401) return { signIn: "expired", error: e.message };
+      return { error: `Meoo 积分查询失败：${e.message}` };
+    }
+  }
+  if (auth.type !== "api" || !auth.key) return { signIn: "expired", error: "meoo-agent：未登录" };
   let body;
   try {
     body = await web(auth.key, "/api/mc/entitlement/get");
@@ -731,8 +942,11 @@ export async function MeooPlugin({ client } = {}) {
       icon: ICON,
       async loader(getAuth) {
         const auth = await getAuth();
-        if (auth?.type !== "api" || !auth.key) return {};
+        if (!auth) return {};
+        // Agent Run endpoints still require the user API Key. An OAuth account carries it
+        // alongside access/refresh fields so the same provider can use both credential domains.
         const key = auth.key;
+        if (!key) return {};
         return {
           baseURL: API,
           apiKey: key,
@@ -762,7 +976,37 @@ export async function MeooPlugin({ client } = {}) {
       // 网关在 usage.query 里先 refresh（对 api key 是 no-op），再调这里；
       // 结果经 reports.mjs 归一化成余额格 / 有效期列要的形状。
       usage: (getAuth) => usage(getAuth, saveExpiry),
+      // Host refreshes OAuth accounts shortly before access-token expiry. This keeps the
+      // stored refresh token current and lets point reads continue after a browser login.
+      refreshLead: REFRESH_LEAD_MS,
+      async refresh(auth) {
+        if (auth?.type !== "oauth" || !auth.refresh) return undefined;
+        try {
+          const next = await renewOAuth(auth, { force: true });
+          return {
+            access: next.access,
+            refresh: next.refresh,
+            expires: next.expires,
+            ...(next.scope ? { scope: next.scope } : {}),
+            ...(next.openid ? { openid: next.openid } : {}),
+          };
+        } catch (e) {
+          if (e?.signIn === "expired") e.signIn = "expired";
+          throw e;
+        }
+      },
       methods: [
+        {
+          type: "oauth",
+          label: "浏览器授权登录（含 API key，推荐）",
+          prompts: [{
+            type: "password",
+            key: "key",
+            message: "Meoo API Key（meoo_ak_…，用于建站 Agent）",
+            placeholder: "meoo_ak_…",
+          }],
+          authorize: browserOAuth,
+        },
         {
           type: "api",
           label: "API key（meoo.com → 设置 → API 密钥）",
@@ -797,7 +1041,7 @@ export async function MeooPlugin({ client } = {}) {
           list.flatMap((m) => variantIds(m).map((v) => [v.id, runtimeModel(v)])),
         );
         const fallback = () => Object.assign(toVariants(MODELS), { [FELL_BACK]: true });
-        if (auth?.type !== "api" || !auth.key) return fallback();
+        if (!auth?.key) return fallback();
         try {
           const pid = await ensureProject(auth.key);
           const cap = await capabilities(auth.key, pid);

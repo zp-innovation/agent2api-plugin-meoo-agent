@@ -40,8 +40,12 @@ then add to `~/.config/magpie/plugins.json`:
 { "spec": "magpie-plugin-meoo-agent" }
 ```
 
-**Provider id:** `meoo-agent` · **Auth:** `API key` — create a `meoo_ak_...` key at
-[meoo.com](https://meoo.com) → 设置 → API 密钥.
+**Provider id:** `meoo-agent`.
+
+When adding an account, choose one of:
+
+- **Browser sign-in (with API key, recommended)** — browser-based Meoo OAuth/PKCE login with a local loopback callback and automatic access-token refresh. You still enter a `meoo_ak_...` API Key because Agent Run endpoints need it; see "Browser sign-in (OAuth)" below.
+- **API key** — create a `meoo_ak_...` key at [meoo.com](https://meoo.com) → 设置 → API 密钥.
 
 ### Using it with Agent2API
 
@@ -53,6 +57,18 @@ fork); the provider id stays `meoo-agent`.
 
 Once installed, the accounts page gains two real columns: **balance** (credit balance plus
 per-grant due dates) and **expiry** (the plan period end). See the next section.
+
+## Browser sign-in (OAuth)
+
+On Agent2API script-plugin hosts that support dynamic login methods, **Add account** offers **Browser sign-in (with API key, recommended)**. It uses Meoo's OAuth Authorization Code + PKCE flow:
+
+1. Enter a `meoo_ak_...` API Key; the plugin verifies it against the entitlement endpoint. The key is still required for `/open/v1/projects/{id}/agent/runs` — public protocol evidence shows no documented exchange from an OAuth access token / project service AK to a user API Key.
+2. The plugin listens temporarily on `127.0.0.1` with a random port. The host opens `https://meoo.com/oauth/authorize`; after browser sign-in Meoo redirects back to the local `/oauth/callback`.
+3. The host relays the callback URL to the plugin, which exchanges it for access/refresh tokens and reads identity and points. The host refreshes the access token before expiry and persists rotated refresh tokens.
+
+**Daily login points** come from the browser login state itself; there is no separate check-in button. Browser sign-in counts as a login for that day, while the API-key method does not. The plugin does not and cannot claim a daily reward through an undocumented "check-in" endpoint (public probing found no such route). If you need the daily points, complete the browser sign-in once per day.
+
+The original API-key method remains available.
 
 ## Speed tiers as model variants
 
